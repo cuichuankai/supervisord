@@ -54,6 +54,10 @@ func (pm *Manager) createProgram(supervisorID string, config *config.Entry) *Pro
 		proc = NewProcess(supervisorID, config)
 		pm.procs[procName] = proc
 	}
+	// Always set processFinder (important for reload)
+	proc.SetProcessFinder(func(name string) *Process {
+		return pm.Find(name)
+	})
 	log.Info("create process:", procName)
 	return proc
 }

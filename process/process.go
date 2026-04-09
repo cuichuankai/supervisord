@@ -100,6 +100,14 @@ type Process struct {
 	stdin      io.WriteCloser
 	StdoutLog  logger.Logger
 	StderrLog  logger.Logger
+	// actualPid is the pid of the actual process to monitor
+	// when monitor_process_name is configured, the command may be a wrapper
+	// and the actual process is different from cmd.Process.Pid
+	actualPid int
+	// useProcessNameMode indicates if this process uses monitor_process_name to find actual process
+	useProcessNameMode bool
+	// processFinder is a function to find other processes by name (for depends_on)
+	processFinder func(name string) *Process
 }
 
 // NewProcess creates new Process object
@@ -112,7 +120,8 @@ func NewProcess(supervisorID string, config *config.Entry) *Process {
 		state:      Stopped,
 		inStart:    false,
 		stopByUser: false,
-		retryTimes: new(int32)}
+		retryTimes: new(int32),
+		actualPid:  0}
 	proc.config = config
 	proc.cmd = nil
 	proc.addToCron()
@@ -137,6 +146,89 @@ func (p *Process) addToCron() {
 		})
 	}
 
+}
+
+// SetProcessFinder sets the function to find other processes by name
+func (p *Process) SetProcessFinder(finder func(name string) *Process) {
+	p.processFinder = finder
+}
+
+// waitForDependencies waits for all dependencies to be running
+// If dependency is not running, it will start the dependency
+func (p *Process) waitForDependencies() {
+	log.WithFields(log.Fields{"program": p.GetName()}).Info("waitForDependencies: START")
+	// Give a small delay to let dependencies start their autorestart
+	time.Sleep(1 * time.Second)
+
+	if p.processFinder == nil {
+		log.WithFields(log.Fields{"program": p.GetName()}).Error("waitForDependencies: processFinder is nil")
+		return
+	}
+
+	dependsOn := p.config.GetString("depends_on", "")
+	log.WithFields(log.Fields{"program": p.GetName(), "depends_on": dependsOn}).Error("waitForDependencies: depends_on config value")
+	if dependsOn == "" {
+		log.WithFields(log.Fields{"program": p.GetName()}).Info("waitForDependencies: no depends_on configured, skip")
+		return
+	}
+
+	log.WithFields(log.Fields{"program": p.GetName(), "depends_on": dependsOn}).Info("waitForDependencies: waiting for dependencies to be ready")
+
+	for _, depName := range strings.Split(dependsOn, ",") {
+		depName = strings.TrimSpace(depName)
+		if depName == "" {
+			continue
+		}
+
+		depProc := p.processFinder(depName)
+		if depProc == nil {
+			log.WithFields(log.Fields{"program": p.GetName(), "depends_on": depName}).Error("waitForDependencies: dependency process not found")
+			continue
+		}
+
+		log.WithFields(log.Fields{"program": p.GetName(), "depends_on": depName}).Info("waitForDependencies: waiting for dependency to be ready")
+		// Wait for dependency to be running
+		// If dependency is not starting or running, start it
+		for {
+			state := depProc.GetState()
+			log.WithFields(log.Fields{"program": p.GetName(), "depends_on": depName, "state": state.String()}).Info("waitForDependencies: checking dependency state")
+
+			if state == Running {
+				log.WithFields(log.Fields{"program": p.GetName(), "depends_on": depName}).Info("waitForDependencies: dependency is running")
+				break
+			}
+			// If dependency is starting, just wait
+			if state == Starting {
+				log.WithFields(log.Fields{"program": p.GetName(), "depends_on": depName, "state": state.String()}).Info("waitForDependencies: dependency is starting, waiting")
+				time.Sleep(500 * time.Millisecond)
+				continue
+			}
+			// If dependency failed fatally, stop waiting
+			if state == Fatal {
+				log.WithFields(log.Fields{"program": p.GetName(), "depends_on": depName}).Error("waitForDependencies: dependency is FATAL, stop waiting")
+				break
+			}
+			// For Exited, Backoff, Stopped, etc., start the dependency
+			log.WithFields(log.Fields{"program": p.GetName(), "depends_on": depName, "state": state.String()}).Info("waitForDependencies: dependency not running, starting it")
+			depProc.Start(false)
+			// After starting, wait for it to become Running
+			for {
+				time.Sleep(200 * time.Millisecond)
+				state = depProc.GetState()
+				log.WithFields(log.Fields{"program": p.GetName(), "depends_on": depName, "state": state.String()}).Info("waitForDependencies: checking started dependency state")
+				if state == Running {
+					log.WithFields(log.Fields{"program": p.GetName(), "depends_on": depName}).Info("waitForDependencies: dependency started and running")
+					break
+				}
+				if state == Fatal {
+					log.WithFields(log.Fields{"program": p.GetName(), "depends_on": depName}).Error("waitForDependencies: dependency failed after start")
+					break
+				}
+			}
+			break
+		}
+	}
+	log.WithFields(log.Fields{"program": p.GetName()}).Info("waitForDependencies: all dependencies ready")
 }
 
 // Start process
@@ -164,6 +256,8 @@ func (p *Process) Start(wait bool) {
 
 	go func() {
 		for {
+			// Wait for dependencies first (on every start, including autorestart)
+			p.waitForDependencies()
 			// we'll do retry start if it sets.
 			p.run(func() {
 				if wait {
@@ -221,12 +315,16 @@ func (p *Process) GetDescription() string {
 		minutes := seconds / 60
 		hours := minutes / 60
 		days := hours / 24
-		if days > 0 {
-			return fmt.Sprintf("pid %d, uptime %d days, %d:%02d:%02d", p.cmd.Process.Pid, days, hours%24, minutes%60, seconds%60)
+		pid := p.cmd.Process.Pid
+		if p.actualPid > 0 {
+			pid = p.actualPid
 		}
-		return fmt.Sprintf("pid %d, uptime %d:%02d:%02d", p.cmd.Process.Pid, hours%24, minutes%60, seconds%60)
+		if days > 0 {
+			return fmt.Sprintf("pid %d, uptime %d days, %d:%02d:%02d", pid, days, hours%24, minutes%60, seconds%60)
+		}
+		return fmt.Sprintf("pid %d, uptime %d:%02d:%02d", pid, hours%24, minutes%60, seconds%60)
 	} else if p.state != Stopped {
-                if p.stopTime.Unix() > 0 {
+		if p.stopTime.Unix() > 0 {
 			return p.stopTime.String()
 		}
 	}
@@ -257,6 +355,9 @@ func (p *Process) GetPid() int {
 
 	if p.state == Stopped || p.state == Fatal || p.state == Unknown || p.state == Exited || p.state == Backoff {
 		return 0
+	}
+	if p.actualPid > 0 {
+		return p.actualPid
 	}
 	return p.cmd.Process.Pid
 }
@@ -397,6 +498,16 @@ func (p *Process) getExitCodes() []int {
 
 // check if the process is running or not
 func (p *Process) isRunning() bool {
+	p.lock.RLock()
+	defer p.lock.RUnlock()
+	return p.isRunningLocked()
+}
+
+func (p *Process) isRunningLocked() bool {
+	if p.actualPid > 0 {
+		proc, err := ps.FindProcess(p.actualPid)
+		return proc != nil && err == nil
+	}
 	if p.cmd != nil && p.cmd.Process != nil {
 		if runtime.GOOS == "windows" {
 			proc, err := ps.FindProcess(p.cmd.Process.Pid)
@@ -405,6 +516,216 @@ func (p *Process) isRunning() bool {
 		return p.cmd.Process.Signal(syscall.Signal(0)) == nil
 	}
 	return false
+}
+
+// monitorActualProcess monitors the actual process (when monitor_process_name is configured)
+// and updates state when the process exits
+func (p *Process) monitorActualProcess() {
+	p.monitorActualProcessWithCallback(func() {})
+}
+
+// monitorActualProcessWithCallback monitors the actual process and calls callback when it exits
+func (p *Process) monitorActualProcessWithCallback(callback func()) {
+	for {
+		time.Sleep(1 * time.Second)
+		p.lock.RLock()
+		actualPid := p.actualPid
+		p.lock.RUnlock()
+
+		if actualPid <= 0 {
+			callback()
+			break
+		}
+
+		// Check if process exists using /proc filesystem (more reliable on Linux/Android)
+		_, err := os.Stat(fmt.Sprintf("/proc/%d", actualPid))
+		if os.IsNotExist(err) {
+			p.lock.Lock()
+			if p.state == Running {
+				log.WithFields(log.Fields{"program": p.GetName(), "actual_pid": actualPid}).Info("actual process exited")
+				p.stopTime = time.Now()
+				p.changeStateTo(Exited)
+			} else if p.state == Stopping {
+				log.WithFields(log.Fields{"program": p.GetName(), "actual_pid": actualPid}).Info("actual process stopped")
+				p.stopTime = time.Now()
+				p.changeStateTo(Stopped)
+			}
+			p.lock.Unlock()
+			callback()
+			break
+		}
+	}
+}
+func (p *Process) isRunningNoLock() bool {
+	// If using monitor_process_name mode, only check actualPid
+	if p.useProcessNameMode {
+		if p.actualPid > 0 {
+			proc, err := ps.FindProcess(p.actualPid)
+			return proc != nil && err == nil
+		}
+		// actualPid not set yet, process is not running
+		return false
+	}
+	if p.actualPid > 0 {
+		proc, err := ps.FindProcess(p.actualPid)
+		return proc != nil && err == nil
+	}
+	if p.cmd != nil && p.cmd.Process != nil {
+		if runtime.GOOS == "windows" {
+			proc, err := ps.FindProcess(p.cmd.Process.Pid)
+			return proc != nil && err == nil
+		}
+		return p.cmd.Process.Signal(syscall.Signal(0)) == nil
+	}
+	return false
+}
+
+// findProcessByName finds a process by its executable name and returns the first matching pid
+// Supports multiple methods for better Android compatibility:
+// 1. Try pidof command (works on Android)
+// 2. Try /proc filesystem (works on Linux/Android)
+// 3. Fallback to go-ps library
+func findProcessByName(name string) (int, error) {
+	// Method 1: Try pidof command (works well on Android)
+	if pid, err := findProcessByPidof(name); err == nil {
+		return pid, nil
+	}
+
+	// Method 2: Try /proc filesystem
+	if pid, err := findProcessByProcfs(name); err == nil {
+		return pid, nil
+	}
+
+	// Method 3: Fallback to go-ps library
+	processes, err := ps.Processes()
+	if err != nil {
+		return 0, fmt.Errorf("failed to get process list: %w", err)
+	}
+	for _, proc := range processes {
+		if proc.Executable() == name {
+			return proc.Pid(), nil
+		}
+	}
+	return 0, fmt.Errorf("process '%s' not found", name)
+}
+
+// findProcessByPidof uses pidof command to find process
+func findProcessByPidof(name string) (int, error) {
+	cmd := exec.Command("pidof", name)
+	output, err := cmd.Output()
+	if err != nil {
+		return 0, fmt.Errorf("pidof failed: %w", err)
+	}
+
+	pids := strings.Fields(strings.TrimSpace(string(output)))
+	if len(pids) == 0 {
+		return 0, fmt.Errorf("no pid found for %s", name)
+	}
+
+	pid, err := strconv.Atoi(pids[0])
+	if err != nil {
+		return 0, fmt.Errorf("invalid pid: %w", err)
+	}
+	return pid, nil
+}
+
+// findProcessByProcfs searches /proc filesystem for matching process
+func findProcessByProcfs(name string) (int, error) {
+	procDir, err := os.Open("/proc")
+	if err != nil {
+		return 0, fmt.Errorf("cannot open /proc: %w", err)
+	}
+	defer procDir.Close()
+
+	entries, err := procDir.Readdirnames(0)
+	if err != nil {
+		return 0, fmt.Errorf("cannot read /proc: %w", err)
+	}
+
+	for _, entry := range entries {
+		pid, err := strconv.Atoi(entry)
+		if err != nil {
+			continue
+		}
+
+		// Try cmdline first (contains full command line)
+		cmdline, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+		if err != nil {
+			continue
+		}
+
+		// cmdline is null-separated, get the first argument
+		cmdlineStr := string(cmdline)
+		if idx := strings.IndexByte(cmdlineStr, 0); idx > 0 {
+			cmdlineStr = cmdlineStr[:idx]
+		}
+
+		// Check if cmdline contains or matches the process name
+		if cmdlineStr == name || strings.Contains(cmdlineStr, name) {
+			return pid, nil
+		}
+
+		// Also try comm (process name)
+		comm, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+		if err != nil {
+			continue
+		}
+		commStr := strings.TrimSpace(string(comm))
+		if commStr == name {
+			return pid, nil
+		}
+	}
+
+	return 0, fmt.Errorf("process '%s' not found in /proc", name)
+}
+
+// waitForProcessName waits for the command to exit, then waits for startsecs,
+// and finds the actual process by monitor_process_name to set actualPid
+// Returns true if the actual process was found, false otherwise
+func (p *Process) waitForProcessName(processName string, startSecs int64) bool {
+	log.WithFields(log.Fields{"program": p.GetName(), "monitor_process_name": processName, "startsecs": startSecs}).Info("waitForProcessName: waiting for command to exit")
+
+	p.cmd.Wait()
+
+	if p.cmd.ProcessState != nil {
+		log.WithFields(log.Fields{"program": p.GetName()}).Infof("waitForProcessName: command exited with status:%v", p.cmd.ProcessState)
+	} else {
+		log.WithFields(log.Fields{"program": p.GetName()}).Info("waitForProcessName: command exited")
+	}
+
+	p.lock.Lock()
+	defer p.lock.Unlock()
+
+	if startSecs > 0 {
+		log.WithFields(log.Fields{"program": p.GetName(), "startsecs": startSecs}).Info("waitForProcessName: waiting for startsecs")
+		p.lock.Unlock()
+		time.Sleep(time.Duration(startSecs) * time.Second)
+		p.lock.Lock()
+	}
+
+	log.WithFields(log.Fields{"program": p.GetName(), "monitor_process_name": processName}).Info("waitForProcessName: searching for process")
+	actualPid, err := findProcessByName(processName)
+	if err != nil {
+		log.WithFields(log.Fields{"program": p.GetName(), "monitor_process_name": processName}).Errorf("waitForProcessName: failed to find process by name: %v", err)
+		p.stopTime = time.Now()
+		if p.StdoutLog != nil {
+			p.StdoutLog.Close()
+		}
+		if p.StderrLog != nil {
+			p.StderrLog.Close()
+		}
+		return false
+	}
+
+	p.actualPid = actualPid
+	if p.StdoutLog != nil {
+		p.StdoutLog.SetPid(actualPid)
+	}
+	if p.StderrLog != nil {
+		p.StderrLog.SetPid(actualPid)
+	}
+	log.WithFields(log.Fields{"program": p.GetName(), "actual_pid": actualPid, "monitor_process_name": processName}).Info("waitForProcessName: found actual process")
+	return true
 }
 
 // create Command object for the program
@@ -547,9 +868,10 @@ func (p *Process) run(finishCb func()) {
 	defer p.lock.Unlock()
 
 	// check if the program is in running state
-	if p.isRunning() {
-		log.WithFields(log.Fields{"program": p.GetName()}).Info("Don't start program because it is running")
-		finishCb()
+	if p.isRunningNoLock() {
+		log.WithFields(log.Fields{"program": p.GetName()}).Debug("Don't start program because it is running")
+		// Don't call finishCb here, just return
+		// The caller should wait for the process to exit
 		return
 	}
 
@@ -625,9 +947,15 @@ func (p *Process) run(finishCb func()) {
 
 		monitorExited := int32(0)
 		programExited := int32(0)
-		// Set startsec to 0 to indicate that the program needn't stay
-		// running for any particular amount of time.
-		if startSecs <= 0 {
+		// Use monitor_process_name for actual process monitoring
+		// This is different from process_name which is used for process identification
+		processName := p.config.GetString("monitor_process_name", "")
+		useProcessName := processName != ""
+		p.useProcessNameMode = useProcessName
+		log.WithFields(log.Fields{"program": p.GetName(), "monitor_process_name": processName, "useProcessName": useProcessName, "startsecs": startSecs}).Info("run: checking monitor_process_name configuration")
+		if useProcessName {
+			atomic.StoreInt32(&monitorExited, 1)
+		} else if startSecs <= 0 {
 			atomic.StoreInt32(&monitorExited, 1)
 			log.WithFields(log.Fields{"program": p.GetName()}).Info("success to start program")
 			p.changeStateTo(Running)
@@ -642,22 +970,66 @@ func (p *Process) run(finishCb func()) {
 		p.lock.Unlock()
 
 		procExitC := make(chan struct{})
+		processNameFound := make(chan bool, 1)
 		go func() {
-			p.waitForExit(startSecs)
+			if useProcessName {
+				processNameFound <- p.waitForProcessName(processName, startSecs)
+			} else {
+				p.waitForExit(startSecs)
+			}
 			close(procExitC)
 		}()
 
+		var foundByProcessName bool
 	LOOP:
 		for {
 			select {
 			case <-procExitC:
+				if useProcessName {
+					foundByProcessName = <-processNameFound
+				}
 				break LOOP
 			default:
-				if !p.isRunning() {
+				if !useProcessName && !p.isRunning() {
 					break LOOP
 				}
 			}
 			time.Sleep(time.Duration(100) * time.Millisecond)
+		}
+
+		if useProcessName && !foundByProcessName {
+			p.lock.Lock()
+			p.changeStateTo(Fatal)
+			p.lock.Unlock()
+			log.WithFields(log.Fields{"program": p.GetName(), "monitor_process_name": processName}).Error("cannot find process by monitor_process_name, marking as FATAL")
+			finishCbWrapper()
+			p.lock.Lock()
+			return
+		}
+
+		if useProcessName && foundByProcessName {
+			p.lock.Lock()
+			log.WithFields(log.Fields{"program": p.GetName(), "actual_pid": p.actualPid}).Info("success to start program with monitor_process_name")
+			p.changeStateTo(Running)
+			p.lock.Unlock()
+
+			// Wait for actual process to exit (similar to waitForExit for normal mode)
+			for p.isRunning() {
+				time.Sleep(time.Duration(100) * time.Millisecond)
+			}
+
+			p.lock.Lock()
+			// Update state after process exits
+			if p.state == Running {
+				p.stopTime = time.Now()
+				p.changeStateTo(Exited)
+				log.WithFields(log.Fields{"program": p.GetName()}).Info("program exited")
+			} else if p.state == Stopping {
+				p.stopTime = time.Now()
+				p.changeStateTo(Stopped)
+				log.WithFields(log.Fields{"program": p.GetName()}).Info("program stopped by user")
+			}
+			break
 		}
 
 		atomic.StoreInt32(&programExited, 1)
@@ -759,6 +1131,15 @@ func (p *Process) sendSignals(sigs []string, sigChildren bool) {
 //	sig - the signal to be sent
 //	sigChildren - if true, the signal also will be sent to children processes too
 func (p *Process) sendSignal(sig os.Signal, sigChildren bool) error {
+	if p.actualPid > 0 {
+		log.WithFields(log.Fields{"program": p.GetName(), "signal": sig, "pid": p.actualPid}).Info("Send signal to actual process")
+		localSig := sig.(syscall.Signal)
+		pid := p.actualPid
+		if sigChildren {
+			pid = -pid
+		}
+		return syscall.Kill(pid, localSig)
+	}
 	if p.cmd != nil && p.cmd.Process != nil {
 		log.WithFields(log.Fields{"program": p.GetName(), "signal": sig}).Info("Send signal to program")
 		err := signals.Kill(p.cmd.Process, sig, sigChildren)
@@ -1049,13 +1430,13 @@ func filterRootEnv(env *[]string) {
 func (p *Process) Stop(wait bool) {
 	p.lock.Lock()
 	p.stopByUser = true
-	isRunning := p.isRunning()
+	isRunning := p.isRunningNoLock()
 	p.lock.Unlock()
 	if !isRunning {
 		log.WithFields(log.Fields{"program": p.GetName()}).Info("program is not running")
 		return
 	}
-  
+
 	log.WithFields(log.Fields{"program": p.GetName()}).Info("stopping the program")
 	p.changeStateTo(Stopping)
 	sigs := strings.Fields(p.config.GetString("stopsignal", "TERM"))
