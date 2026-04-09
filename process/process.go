@@ -95,11 +95,13 @@ type Process struct {
 	inStart bool
 	// true if the process is stopped by user
 	stopByUser bool
-	retryTimes *int32
-	lock       sync.RWMutex
-	stdin      io.WriteCloser
-	StdoutLog  logger.Logger
-	StderrLog  logger.Logger
+	// true if the process is stopped by restart_after_secs timer
+	restartByTimer bool
+	retryTimes     *int32
+	lock           sync.RWMutex
+	stdin          io.WriteCloser
+	StdoutLog      logger.Logger
+	StderrLog      logger.Logger
 	// actualPid is the pid of the actual process to monitor
 	// when monitor_process_name is configured, the command may be a wrapper
 	// and the actual process is different from cmd.Process.Pid
@@ -108,6 +110,8 @@ type Process struct {
 	useProcessNameMode bool
 	// processFinder is a function to find other processes by name (for depends_on)
 	processFinder func(name string) *Process
+	// restartAfterTimerChan is used to cancel the restart_after_secs timer
+	restartAfterTimerChan chan struct{}
 }
 
 // NewProcess creates new Process object
@@ -156,7 +160,6 @@ func (p *Process) SetProcessFinder(finder func(name string) *Process) {
 // waitForDependencies waits for all dependencies to be running
 // If dependency is not running, it will start the dependency
 func (p *Process) waitForDependencies() {
-	log.WithFields(log.Fields{"program": p.GetName()}).Info("waitForDependencies: START")
 	// Give a small delay to let dependencies start their autorestart
 	time.Sleep(1 * time.Second)
 
@@ -166,13 +169,11 @@ func (p *Process) waitForDependencies() {
 	}
 
 	dependsOn := p.config.GetString("depends_on", "")
-	log.WithFields(log.Fields{"program": p.GetName(), "depends_on": dependsOn}).Error("waitForDependencies: depends_on config value")
 	if dependsOn == "" {
-		log.WithFields(log.Fields{"program": p.GetName()}).Info("waitForDependencies: no depends_on configured, skip")
 		return
 	}
 
-	log.WithFields(log.Fields{"program": p.GetName(), "depends_on": dependsOn}).Info("waitForDependencies: waiting for dependencies to be ready")
+	log.WithFields(log.Fields{"program": p.GetName(), "depends_on": dependsOn}).Info("waitForDependencies: waiting for dependencies")
 
 	for _, depName := range strings.Split(dependsOn, ",") {
 		depName = strings.TrimSpace(depName)
@@ -186,12 +187,11 @@ func (p *Process) waitForDependencies() {
 			continue
 		}
 
-		log.WithFields(log.Fields{"program": p.GetName(), "depends_on": depName}).Info("waitForDependencies: waiting for dependency to be ready")
 		// Wait for dependency to be running
 		// If dependency is not starting or running, start it
+		lastState := State(-1)
 		for {
 			state := depProc.GetState()
-			log.WithFields(log.Fields{"program": p.GetName(), "depends_on": depName, "state": state.String()}).Info("waitForDependencies: checking dependency state")
 
 			if state == Running {
 				log.WithFields(log.Fields{"program": p.GetName(), "depends_on": depName}).Info("waitForDependencies: dependency is running")
@@ -199,25 +199,28 @@ func (p *Process) waitForDependencies() {
 			}
 			// If dependency is starting, just wait
 			if state == Starting {
-				log.WithFields(log.Fields{"program": p.GetName(), "depends_on": depName, "state": state.String()}).Info("waitForDependencies: dependency is starting, waiting")
+				if lastState != Starting {
+					log.WithFields(log.Fields{"program": p.GetName(), "depends_on": depName}).Info("waitForDependencies: waiting for dependency to start")
+				}
+				lastState = state
 				time.Sleep(500 * time.Millisecond)
 				continue
 			}
 			// If dependency failed fatally, stop waiting
 			if state == Fatal {
-				log.WithFields(log.Fields{"program": p.GetName(), "depends_on": depName}).Error("waitForDependencies: dependency is FATAL, stop waiting")
+				log.WithFields(log.Fields{"program": p.GetName(), "depends_on": depName}).Error("waitForDependencies: dependency is FATAL")
 				break
 			}
 			// For Exited, Backoff, Stopped, etc., start the dependency
-			log.WithFields(log.Fields{"program": p.GetName(), "depends_on": depName, "state": state.String()}).Info("waitForDependencies: dependency not running, starting it")
+			log.WithFields(log.Fields{"program": p.GetName(), "depends_on": depName, "state": state.String()}).Info("waitForDependencies: starting dependency")
 			depProc.Start(false)
 			// After starting, wait for it to become Running
+			lastState = State(-1)
 			for {
 				time.Sleep(200 * time.Millisecond)
 				state = depProc.GetState()
-				log.WithFields(log.Fields{"program": p.GetName(), "depends_on": depName, "state": state.String()}).Info("waitForDependencies: checking started dependency state")
 				if state == Running {
-					log.WithFields(log.Fields{"program": p.GetName(), "depends_on": depName}).Info("waitForDependencies: dependency started and running")
+					log.WithFields(log.Fields{"program": p.GetName(), "depends_on": depName}).Info("waitForDependencies: dependency started")
 					break
 				}
 				if state == Fatal {
@@ -228,7 +231,6 @@ func (p *Process) waitForDependencies() {
 			break
 		}
 	}
-	log.WithFields(log.Fields{"program": p.GetName()}).Info("waitForDependencies: all dependencies ready")
 }
 
 // Start process
@@ -418,6 +420,10 @@ func (p *Process) getStartRetries() int32 {
 	return int32(p.config.GetInt("startretries", 3))
 }
 
+func (p *Process) getRestartAfterSecs() int64 {
+	return int64(p.config.GetInt("restart_after_secs", 0))
+}
+
 func (p *Process) isAutoStart() bool {
 	return p.config.GetString("autostart", "true") == "true"
 }
@@ -505,6 +511,12 @@ func (p *Process) isRunning() bool {
 
 func (p *Process) isRunningLocked() bool {
 	if p.actualPid > 0 {
+		// Use /proc filesystem for more reliable check on Linux/Android
+		_, err := os.Stat(fmt.Sprintf("/proc/%d", p.actualPid))
+		if err == nil {
+			return true
+		}
+		// Fallback to ps.FindProcess
 		proc, err := ps.FindProcess(p.actualPid)
 		return proc != nil && err == nil
 	}
@@ -560,6 +572,12 @@ func (p *Process) isRunningNoLock() bool {
 	// If using monitor_process_name mode, only check actualPid
 	if p.useProcessNameMode {
 		if p.actualPid > 0 {
+			// Use /proc filesystem for more reliable check on Linux/Android
+			_, err := os.Stat(fmt.Sprintf("/proc/%d", p.actualPid))
+			if err == nil {
+				return true
+			}
+			// Fallback to ps.FindProcess
 			proc, err := ps.FindProcess(p.actualPid)
 			return proc != nil && err == nil
 		}
@@ -567,6 +585,12 @@ func (p *Process) isRunningNoLock() bool {
 		return false
 	}
 	if p.actualPid > 0 {
+		// Use /proc filesystem for more reliable check on Linux/Android
+		_, err := os.Stat(fmt.Sprintf("/proc/%d", p.actualPid))
+		if err == nil {
+			return true
+		}
+		// Fallback to ps.FindProcess
 		proc, err := ps.FindProcess(p.actualPid)
 		return proc != nil && err == nil
 	}
@@ -853,6 +877,67 @@ func (p *Process) monitorProgramIsRunning(endTime time.Time, monitorExited *int3
 	if atomic.LoadInt32(programExited) == 0 && p.state == Starting {
 		log.WithFields(log.Fields{"program": p.GetName()}).Info("success to start program")
 		p.changeStateTo(Running)
+		p.startRestartAfterTimer()
+	}
+}
+
+// startRestartAfterTimer starts a timer to restart the process after restart_after_secs
+func (p *Process) startRestartAfterTimer() {
+	restartAfterSecs := p.getRestartAfterSecs()
+	log.WithFields(log.Fields{"program": p.GetName(), "restart_after_secs": restartAfterSecs}).Info("startRestartAfterTimer called")
+	if restartAfterSecs <= 0 {
+		log.WithFields(log.Fields{"program": p.GetName()}).Info("startRestartAfterTimer: restart_after_secs <= 0, skip")
+		return
+	}
+
+	// Cancel any existing timer
+	if p.restartAfterTimerChan != nil {
+		close(p.restartAfterTimerChan)
+	}
+	p.restartAfterTimerChan = make(chan struct{})
+
+	log.WithFields(log.Fields{"program": p.GetName(), "restart_after_secs": restartAfterSecs}).Info("starting restart_after_secs timer")
+
+	go func() {
+		timer := time.NewTimer(time.Duration(restartAfterSecs) * time.Second)
+		defer timer.Stop()
+
+		select {
+		case <-timer.C:
+			p.lock.RLock()
+			state := p.state
+			p.lock.RUnlock()
+
+			log.WithFields(log.Fields{"program": p.GetName(), "state": state.String()}).Info("restart_after_secs timer expired")
+			if state == Running {
+				log.WithFields(log.Fields{"program": p.GetName()}).Info("restart_after_secs: setting restartByTimer and stopping process")
+				// Set restartByTimer flag before stopping
+				p.lock.Lock()
+				p.restartByTimer = true
+				p.lock.Unlock()
+				// Stop the process
+				p.Stop(false)
+				// Start the process again
+				p.Start(false)
+			} else {
+				log.WithFields(log.Fields{"program": p.GetName(), "state": state.String()}).Info("restart_after_secs: process not in Running state, skip restart")
+			}
+		case <-p.restartAfterTimerChan:
+			log.WithFields(log.Fields{"program": p.GetName()}).Info("restart_after_secs timer cancelled")
+		}
+	}()
+}
+
+// stopRestartAfterTimer stops the restart_after_secs timer
+func (p *Process) stopRestartAfterTimer() {
+	if p.restartAfterTimerChan != nil {
+		select {
+		case <-p.restartAfterTimerChan:
+			// already closed
+		default:
+			close(p.restartAfterTimerChan)
+		}
+		p.restartAfterTimerChan = nil
 	}
 }
 
@@ -959,6 +1044,7 @@ func (p *Process) run(finishCb func()) {
 			atomic.StoreInt32(&monitorExited, 1)
 			log.WithFields(log.Fields{"program": p.GetName()}).Info("success to start program")
 			p.changeStateTo(Running)
+			p.startRestartAfterTimer()
 			go finishCbWrapper()
 		} else {
 			go func() {
@@ -1011,6 +1097,7 @@ func (p *Process) run(finishCb func()) {
 			p.lock.Lock()
 			log.WithFields(log.Fields{"program": p.GetName(), "actual_pid": p.actualPid}).Info("success to start program with monitor_process_name")
 			p.changeStateTo(Running)
+			p.startRestartAfterTimer()
 			p.lock.Unlock()
 
 			// Wait for actual process to exit (similar to waitForExit for normal mode)
@@ -1429,9 +1516,19 @@ func filterRootEnv(env *[]string) {
 // Stop sends signal to process to make it quit
 func (p *Process) Stop(wait bool) {
 	p.lock.Lock()
-	p.stopByUser = true
+	// Only set stopByUser if this is not a timer-triggered restart
+	if !p.restartByTimer {
+		p.stopByUser = true
+	} else {
+		log.WithFields(log.Fields{"program": p.GetName()}).Info("Stop: restartByTimer is true, not setting stopByUser")
+		p.restartByTimer = false
+	}
 	isRunning := p.isRunningNoLock()
+	actualPid := p.actualPid
+	useProcessNameMode := p.useProcessNameMode
+	p.stopRestartAfterTimer()
 	p.lock.Unlock()
+	log.WithFields(log.Fields{"program": p.GetName(), "isRunning": isRunning, "actualPid": actualPid, "useProcessNameMode": useProcessNameMode}).Info("Stop: checking if process is running")
 	if !isRunning {
 		log.WithFields(log.Fields{"program": p.GetName()}).Info("program is not running")
 		return
@@ -1439,6 +1536,44 @@ func (p *Process) Stop(wait bool) {
 
 	log.WithFields(log.Fields{"program": p.GetName()}).Info("stopping the program")
 	p.changeStateTo(Stopping)
+
+	// Check if stop_command is configured
+	stopCommand := p.config.GetString("stop_command", "")
+	if stopCommand != "" {
+		log.WithFields(log.Fields{"program": p.GetName(), "stop_command": stopCommand}).Info("executing stop_command")
+		go func() {
+			_, err := executeCommand(stopCommand)
+			if err != nil {
+				log.WithFields(log.Fields{"program": p.GetName(), "stop_command": stopCommand, "error": err}).Error("failed to execute stop_command")
+			} else {
+				log.WithFields(log.Fields{"program": p.GetName(), "stop_command": stopCommand}).Info("stop_command executed successfully")
+			}
+			// Wait for process to stop
+			stopWaitSecs := p.config.GetInt("stopwaitsecs", 10)
+			endTime := time.Now().Add(time.Duration(stopWaitSecs) * time.Second)
+			for time.Now().Before(endTime) {
+				p.lock.RLock()
+				state := p.state
+				p.lock.RUnlock()
+				if state != Starting && state != Running && state != Stopping {
+					return
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+			// Force kill if still running
+			log.WithFields(log.Fields{"program": p.GetName()}).Info("process still running after stop_command, force killing")
+			p.lock.Lock()
+			if p.actualPid > 0 {
+				syscall.Kill(p.actualPid, syscall.SIGKILL)
+			}
+			p.lock.Unlock()
+		}()
+		if wait {
+			time.Sleep(time.Duration(p.config.GetInt("stopwaitsecs", 10)) * time.Second)
+		}
+		return
+	}
+
 	sigs := strings.Fields(p.config.GetString("stopsignal", "TERM"))
 	waitsecs := time.Duration(p.config.GetInt("stopwaitsecs", 10)) * time.Second
 	killwaitsecs := time.Duration(p.config.GetInt("killwaitsecs", 2)) * time.Second
